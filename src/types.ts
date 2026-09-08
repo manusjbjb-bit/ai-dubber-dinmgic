@@ -6,6 +6,7 @@ export interface SubtitleLine {
   selected: boolean;
   generated: boolean;
   audioUrl?: string;
+  audioDuration?: number;
 }
 
 export type ViewState = 'home' | 'editor' | 'settings';

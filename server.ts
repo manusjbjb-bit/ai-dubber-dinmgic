@@ -35,11 +35,205 @@ function logFfmpegDiagnostic(stepName, command, error, stderr, stdout) {
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const MAX_ALLOWED_TTS_OVERSPEECH = 0.25;
+const MAX_TTS_SPEED_INCREASE = 0.35;
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true, limit: '500mb' }));
 
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 500 * 1024 * 1024 } });
+
+type AudioSegmentMetadata = {
+  key: string;
+  start: string;
+  end: string;
+  segmentId?: string;
+  speakerId?: string;
+  voiceId?: string;
+  expectedDuration?: number;
+};
+
+type RenderedAudioSegment = {
+  key: string;
+  path: string;
+  metadata: AudioSegmentMetadata;
+  startSeconds: number;
+  endSeconds: number;
+  sourceDuration: number;
+  ttsDuration: number;
+  placementSeconds: number;
+  rate: number;
+  sampleRate: number;
+  channels: number;
+  renderOrder: number;
+};
+
+function parseTimestamp(value: string | undefined): number | null {
+  if (!value || typeof value !== 'string') return null;
+  const parts = value.replace(',', '.').trim().split(':').map((part) => Number(part));
+  if (parts.some((part) => !Number.isFinite(part))) return null;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 1) return parts[0];
+  return null;
+}
+
+function formatSeconds(seconds: number): string {
+  return seconds.toFixed(3);
+}
+
+async function probeAudio(path: string): Promise<{ duration: number; sampleRate: number; channels: number }> {
+  const command = `ffprobe -v error -show_entries stream=sample_rate,channels -show_entries format=duration -of json "${path}"`;
+  const { stdout } = await execAsync(command);
+  const parsed = JSON.parse(stdout);
+  const duration = Number(parsed?.format?.duration);
+  const sampleRate = Number(parsed?.streams?.[0]?.sample_rate);
+  const channels = Number(parsed?.streams?.[0]?.channels);
+  if (!Number.isFinite(duration) || duration <= 0 ||
+      !Number.isFinite(sampleRate) || sampleRate <= 0 ||
+      !Number.isFinite(channels) || channels <= 0) {
+    throw new Error(`Invalid audio metadata for ${path}`);
+  }
+  return { duration, sampleRate, channels };
+}
+
+async function buildRenderedAudioSegments(
+  files: Express.Multer.File[],
+  metadata: AudioSegmentMetadata[]
+): Promise<RenderedAudioSegment[]> {
+  const audioFiles = files
+    .filter((file) => file.fieldname.startsWith('audio_'))
+    .map((file) => ({ file, stat: fs.statSync(file.path) }))
+    .filter(({ file, stat }) => stat.isFile() && stat.size > 100)
+    .sort((a, b) => a.file.fieldname.localeCompare(b.file.fieldname, 'en', { numeric: true }));
+
+  const metadataByKey = new Map<string, AudioSegmentMetadata>();
+  for (const item of metadata) {
+    if (!item || typeof item.key !== 'string' || !item.key.startsWith('audio_')) {
+      throw new Error('Invalid audio metadata entry');
+    }
+    if (metadataByKey.has(item.key)) {
+      throw new Error(`Duplicate audio metadata key: ${item.key}`);
+    }
+    metadataByKey.set(item.key, item);
+  }
+
+  const audioKeys = new Set(audioFiles.map(({ file }) => file.fieldname));
+  const missingAudio = metadata.filter((item) => !audioKeys.has(item.key)).map((item) => item.key);
+  if (missingAudio.length > 0) {
+    throw new Error(`Missing TTS audio files: ${missingAudio.join(', ')}`);
+  }
+  const extraAudio = [...audioKeys].filter((key) => !metadataByKey.has(key));
+  if (extraAudio.length > 0) {
+    throw new Error(`TTS audio files without timeline metadata: ${extraAudio.join(', ')}`);
+  }
+
+  const segmentIds = new Set<string>();
+  const renderedSegments: RenderedAudioSegment[] = [];
+  for (let index = 0; index < audioFiles.length; index++) {
+    const { file } = audioFiles[index];
+    const item = metadataByKey.get(file.fieldname);
+    const startSeconds = parseTimestamp(item?.start);
+    const endSeconds = parseTimestamp(item?.end);
+    if (startSeconds === null || startSeconds < 0) {
+      throw new Error(`Invalid start timestamp for ${file.fieldname}`);
+    }
+    if (endSeconds === null || endSeconds <= startSeconds) {
+      throw new Error(`Invalid end timestamp for ${file.fieldname}`);
+    }
+    const sourceDuration = endSeconds - startSeconds;
+    if (item?.segmentId !== undefined) {
+      if (typeof item.segmentId !== 'string' || item.segmentId.length === 0) {
+        throw new Error(`Invalid segment ID for ${file.fieldname}`);
+      }
+      if (segmentIds.has(item.segmentId)) {
+        throw new Error(`Duplicate segment ID: ${item.segmentId}`);
+      }
+      segmentIds.add(item.segmentId);
+    }
+
+    const probed = await probeAudio(file.path);
+    if (item?.expectedDuration !== undefined) {
+      const expectedDuration = Number(item.expectedDuration);
+      if (!Number.isFinite(expectedDuration) || Math.abs(expectedDuration - probed.duration) > 0.1) {
+        throw new Error(`TTS duration changed for ${file.fieldname}`);
+      }
+    }
+
+    const availableDuration = sourceDuration + MAX_ALLOWED_TTS_OVERSPEECH;
+    if (probed.duration <= availableDuration) {
+      renderedSegments.push({
+        key: file.fieldname,
+        path: file.path,
+        metadata: item!,
+        startSeconds,
+        endSeconds,
+        sourceDuration,
+        ttsDuration: probed.duration,
+        placementSeconds: startSeconds,
+        rate: 1,
+        sampleRate: probed.sampleRate,
+        channels: probed.channels,
+        renderOrder: index + 1
+      });
+      continue;
+    }
+
+    const requiredSpeedIncrease = (probed.duration - availableDuration) / availableDuration;
+    if (requiredSpeedIncrease > MAX_TTS_SPEED_INCREASE) {
+      throw new Error(
+        `TTS audio is too long for ${file.fieldname}: ` +
+        `${formatSeconds(probed.duration)}s audio, ${formatSeconds(availableDuration)}s available`
+      );
+    }
+    const rate = Math.min(1 + requiredSpeedIncrease, 1 + MAX_TTS_SPEED_INCREASE);
+    renderedSegments.push({
+      key: file.fieldname,
+      path: file.path,
+      metadata: item!,
+      startSeconds,
+      endSeconds,
+      sourceDuration,
+      ttsDuration: probed.duration / rate,
+      placementSeconds: startSeconds,
+      rate,
+      sampleRate: probed.sampleRate,
+      channels: probed.channels,
+      renderOrder: index + 1
+    });
+  }
+  return renderedSegments;
+}
+
+function validateSegmentTimeline(
+  segments: RenderedAudioSegment[],
+  videoDuration: number
+): void {
+  for (const segment of segments) {
+    if (segment.endSeconds > videoDuration + 0.25) {
+      throw new Error(`Segment ${segment.key} ends after the video`);
+    }
+    if (segment.placementSeconds < 0) {
+      throw new Error(`Segment ${segment.key} has a negative placement timestamp`);
+    }
+  }
+
+  const sorted = [...segments].sort((a, b) => a.startSeconds - b.startSeconds);
+  for (let index = 0; index < sorted.length; index++) {
+    const current = sorted[index];
+    for (let nextIndex = index + 1; nextIndex < sorted.length; nextIndex++) {
+      const next = sorted[nextIndex];
+      const overlap = current.placementSeconds + current.ttsDuration - next.placementSeconds;
+      const nextStartsAfterCurrentSource = next.startSeconds >= current.endSeconds;
+      if (overlap > 0.1 && nextStartsAfterCurrentSource) {
+        throw new Error(
+          `Unintended TTS overlap: ${current.key} would overlap ${next.key} by ${formatSeconds(overlap)}s`
+        );
+      }
+      if (next.startSeconds >= current.endSeconds) break;
+    }
+  }
+}
 
 const defaultGeminiKey = process.env.GEMINI_API_KEY;
 const ai = defaultGeminiKey ? new GoogleGenAI({ apiKey: defaultGeminiKey }) : null;
@@ -77,6 +271,7 @@ const exportCache = new Map<string, string>();
 // ============================================================
 
 async function translateSubtitleLinesToKhmer(
+  currentAi: GoogleGenAI,
   sourceLines: any[],
   geminiModel: string
 ): Promise<any[]> {
@@ -246,7 +441,7 @@ app.post('/api/transcribe/start', async (req, res) => {
   const reqAwsRegion = req.headers['x-aws-region'] as string;
   const reqAwsS3Bucket = req.headers['x-aws-s3-bucket'] as string;
   const jobId = Date.now().toString();
-  
+
   jobs.set(jobId, { status: 'starting', progress: 40 });
   res.json({ jobId });
 
@@ -254,7 +449,7 @@ app.post('/api/transcribe/start', async (req, res) => {
   (async () => {
     try {
       const filePath = path.join(os.tmpdir(), `upload_${fileId}`);
-      
+
       // Merge chunks
       if (fs.existsSync(filePath)) {
          fs.unlinkSync(filePath);
@@ -268,7 +463,7 @@ app.post('/api/transcribe/start', async (req, res) => {
         fs.appendFileSync(filePath, chunkData);
         fs.unlinkSync(chunkPath);
       }
-      
+
       if (!fs.existsSync(filePath)) {
          throw new Error('File not found on server');
       }
@@ -282,12 +477,12 @@ app.post('/api/transcribe/start', async (req, res) => {
             'Gemini API Key មិនត្រូវបានកំណត់។ សូមបញ្ចូល Gemini API Key ក្នុង App Settings។'
           );
         }
-      
+
       let uploadPath = filePath;
       let uploadMime = mimetype;
-      
+
       const isVideo = mimetype.startsWith('video/') || mimetype === 'application/octet-stream' || mimetype === '';
-      
+
       if (isVideo) {
         console.log('Extracting audio from video to speed up upload...');
         jobs.set(jobId, { status: 'extracting audio', progress: 42 });
@@ -316,10 +511,10 @@ app.post('/api/transcribe/start', async (req, res) => {
 if (activeModel === 'amazon') {
          jobs.set(jobId, { status: 'uploading to s3', progress: 45 });
          console.log(`Uploading file to S3... ${uploadPath}`);
-         
+
          const region = reqAwsRegion || process.env.AWS_REGION || 'ap-southeast-2';
          const bucket = reqAwsS3Bucket || process.env.AWS_S3_BUCKET || 'elasticbeanstalk-ap-southeast-2-824353504213';
-         
+
          const awsConfig = {
            region,
            credentials: {
@@ -327,25 +522,25 @@ if (activeModel === 'amazon') {
              secretAccessKey: reqAwsSecretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || ''
            }
          };
-         
+
          if (!awsConfig.credentials.accessKeyId) {
              throw new Error("ការកំណត់ AWS Credentials មិនទាន់បានបំពេញ (AWS_ACCESS_KEY_ID នៅក្នុងកូដម៉ាស៊ីន)។");
          }
-         
+
          const s3Client = new S3Client(awsConfig);
          const transcribeClient = new TranscribeClient(awsConfig);
-         
+
          const s3Key = `uploads/${jobId}_audio.mp3`;
          const uploadStream = fs.createReadStream(uploadPath);
-         
+
          await s3Client.send(new PutObjectCommand({
              Bucket: bucket,
              Key: s3Key,
              Body: uploadStream
          }));
-         
+
          jobs.set(jobId, { status: 'transcribing with amazon', progress: 50 });
-         
+
          const transcribeJobName = `TranscribeJob_${jobId}`;
          await transcribeClient.send(new StartTranscriptionJobCommand({
              TranscriptionJobName: transcribeJobName,
@@ -353,7 +548,7 @@ if (activeModel === 'amazon') {
              MediaFormat: "mp3",
              Media: { MediaFileUri: `s3://${bucket}/${s3Key}` },
          }));
-         
+
          let transcribeStatus = 'IN_PROGRESS';
          let transcriptUri = '';
          let retries = 0;
@@ -361,7 +556,7 @@ if (activeModel === 'amazon') {
              await new Promise(r => setTimeout(r, 5000));
              const jobRes = await transcribeClient.send(new GetTranscriptionJobCommand({ TranscriptionJobName: transcribeJobName }));
              transcribeStatus = jobRes.TranscriptionJob?.TranscriptionJobStatus || 'FAILED';
-             
+
              if (transcribeStatus === 'COMPLETED') {
                  transcriptUri = jobRes.TranscriptionJob?.Transcript?.TranscriptFileUri || '';
                  break;
@@ -372,17 +567,17 @@ if (activeModel === 'amazon') {
              retries++;
              jobs.set(jobId, { status: 'transcribing with amazon', progress: 50 + Math.min(retries * 2, 35) });
          }
-         
+
          jobs.set(jobId, { status: 'processing results', progress: 85 });
-         
+
          const resultRes = await fetch(transcriptUri);
          const resultJson: any = await resultRes.json();
-         
+
          // Parse resultJson to {id, start, end, text}
          const items = resultJson.results?.items || [];
          let originalLines = [];
          let currentLine = null;
-         
+
          let wordCount = 0;
          for (const item of items) {
              if (item.type === 'pronunciation') {
@@ -393,7 +588,7 @@ if (activeModel === 'amazon') {
                      const gap = parseFloat(item.start_time) - parseFloat(currentLine.end);
                      const duration = parseFloat(item.end_time) - parseFloat(currentLine.start);
                      const isPunctuationEnding = currentLine.text.match(/[.!?]$/);
-                     
+
                      // Tighter chunking for perfect lip sync:
                      // 1. Pause > 0.5s
                      // 2. Line duration > 3.5s (don't make sentences too long)
@@ -414,7 +609,7 @@ if (activeModel === 'amazon') {
              }
          }
          if (currentLine) originalLines.push(currentLine);
-         
+
          // Helper to convert float seconds to M:SS.S
          const formatTimestamp = (secStr) => {
              const secFloat = parseFloat(secStr);
@@ -422,30 +617,30 @@ if (activeModel === 'amazon') {
              const secs = secFloat % 60;
              return `${mins}:${secs.toFixed(1).padStart(4, '0')}`;
          };
-         
+
          originalLines = originalLines.map(line => ({
              id: line.id,
              start: formatTimestamp(line.start),
              end: formatTimestamp(line.end),
              text: line.text
          }));
-         
+
          if (originalLines.length === 0) {
              throw new Error("AWS Transcribe មិនអាចស្គាល់សំឡេងបានទេ (No speech detected). អាចដោយសារវីដេអូគ្មានសំឡេង ឬប្រើភាសាដែលប្រព័ន្ធមិនស្គាល់។");
          }
 
          jobs.set(jobId, { status: 'translating to khmer', progress: 90 });
          console.log(`Translating ${originalLines.length} lines to Khmer...`);
-         
+
          // Translate via Gemini in chunks
          const CHUNK_SIZE = 40;
          let translatedLines = [];
-         
+
          for (let i = 0; i < originalLines.length; i += CHUNK_SIZE) {
              const chunk = originalLines.slice(i, i + CHUNK_SIZE);
              let chunkSuccess = false;
              let generateRetries = 0;
-             
+
              while (!chunkSuccess && generateRetries < 3) {
                  try {
                      const response = await currentAi.models.generateContent({
@@ -460,7 +655,7 @@ if (activeModel === 'amazon') {
                              responseMimeType: 'application/json',
                          }
                      });
-                     
+
                      let responseText = response.text || '';
                      const cleanedResponse = responseText.trim();
                       const parsedChunk = JSON.parse(cleanedResponse);
@@ -502,31 +697,31 @@ if (activeModel === 'amazon') {
                      await new Promise(r => setTimeout(r, 3000));
                  }
              }
-             
+
              const translateProgress = 90 + Math.floor((i / originalLines.length) * 10);
              const percent = Math.floor(Math.min(100, ((i + CHUNK_SIZE) / originalLines.length) * 100));
              jobs.set(jobId, { status: `translating (${percent}%)`, progress: Math.min(99, translateProgress) });
          }
-         
+
          // Cleanup S3
          try {
              await s3Client.send(new DeleteObjectCommand({ Bucket: bucket, Key: s3Key }));
          } catch(e) { console.error('Failed to cleanup S3', e); }
-         
+
          if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
          if (uploadPath !== filePath && fs.existsSync(uploadPath)) fs.unlinkSync(uploadPath);
-         
+
          jobs.set(jobId, { status: 'done', progress: 100, lines: translatedLines });
          return; // Exit here for Amazon
       }
-      
+
       // Upload to Gemini
       console.log(`Uploading file to Gemini... ${uploadPath}`);
       jobs.set(jobId, { status: 'uploading to gemini', progress: 45 });
-      
+
       const fileBuffer = fs.readFileSync(uploadPath);
       const fileBlob = new Blob([fileBuffer]);
-      
+
       const uploadResult = await currentAi.files.upload({ file: fileBlob, config: { mimeType: uploadMime } });
       console.log(`Upload complete. Generating content...`);
 
@@ -559,7 +754,7 @@ if (activeModel === 'amazon') {
             jobs.set(jobId, { status: `retrying generation (${generateRetries}/3)`, progress: 75 });
             await new Promise(resolve => setTimeout(resolve, 5000 * generateRetries)); // Exponential-ish backoff
           }
-          
+
           response = await currentAi.models.generateContent({
             model: activeGeminiModel,
             contents: [
@@ -639,7 +834,7 @@ Do not output an empty array unless there is absolutely no speech.` },
 
       let responseText = response?.text || '';
       responseText = responseText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-      
+
       let lines;
       try {
         lines = JSON.parse(responseText);
@@ -667,7 +862,7 @@ Do not output an empty array unless there is absolutely no speech.` },
       if (lines.length === 0) {
           throw new Error('ការបកប្រែទទួលបានអក្សរទទេ (0 lines) ពីប្រព័ន្ធ។ សូមសាកល្បងកាត់វីដេអូជាចំណែកខ្លីៗ។ Data: ' + responseText.substring(0, 100));
       }
-      
+
       // Clean up
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
       if (uploadPath !== filePath && fs.existsSync(uploadPath)) fs.unlinkSync(uploadPath);
@@ -713,7 +908,7 @@ app.post('/api/test-aws', async (req, res) => {
         };
 
         const s3Client = new S3Client(awsConfig);
-        
+
         // Try to list objects in the bucket to test credentials and bucket access
         const testCommand = new ListObjectsV2Command({ Bucket: reqAwsS3Bucket, MaxKeys: 1 });
         await s3Client.send(testCommand);
@@ -745,19 +940,23 @@ app.get('/api/transcribe/status', (req, res) => {
 app.post('/api/tts', async (req, res) => {
   try {
     const { text, voice } = req.body;
-    
-    // Fallbacks if not provided
+    if (typeof text !== 'string' || text.trim().length === 0) {
+      return res.status(400).json({ error: 'TTS text is required' });
+    }
+
     const targetVoice = voice === 'Sreymom' ? 'km-KH-SreymomNeural' : 'km-KH-PisethNeural';
-    
+
     const tts = new EdgeTTS({ voice: targetVoice, lang: 'km-KH' });
-    
-    const tempFile = path.join(os.tmpdir(), `tts_${Date.now()}.mp3`);
+
+    const tempFile = path.join(os.tmpdir(), `tts_${crypto.randomUUID()}.mp3`);
     await tts.ttsPromise(text, tempFile);
-    
+
+    const probed = await probeAudio(tempFile);
     const audioBuffer = fs.readFileSync(tempFile);
     fs.unlinkSync(tempFile);
-    
+
     res.set('Content-Type', 'audio/mpeg');
+    res.set('X-TTS-Duration', probed.duration.toFixed(3));
     res.send(audioBuffer);
   } catch (error: any) {
     console.error('TTS Error:', error);
@@ -765,16 +964,17 @@ app.post('/api/tts', async (req, res) => {
   }
 });
 
+
 app.post('/api/export-video', upload.any(), async (req, res) => {
   try {
     const files = req.files as Express.Multer.File[] || [];
     const srtFile = files.find(f => f.fieldname === 'srt');
-    
+
     // Hash inputs for caching
     const metadataStr = req.body.metadata || '';
     const videoFileId = req.body.videoFileId || '';
     const srtContent = srtFile && fs.existsSync(srtFile.path) ? fs.readFileSync(srtFile.path, 'utf8') : '';
-    
+
 const hash = crypto.createHash('sha256');
     hash.update(videoFileId);
     hash.update(metadataStr);
@@ -788,7 +988,7 @@ const hash = crypto.createHash('sha256');
         }
     }
     const exportKey = hash.digest('hex');
-    
+
     if (exportCache.has(exportKey)) {
         const existingJobId = exportCache.get(exportKey);
         const job = exportJobs.get(existingJobId!);
@@ -808,7 +1008,7 @@ const hash = crypto.createHash('sha256');
     }
     let videoPath = '';
     const videoTotalChunks = parseInt(req.body.videoTotalChunks || '0', 10);
-    
+
     if (videoFileId && videoTotalChunks > 0) {
       videoPath = path.join(os.tmpdir(), `upload_${videoFileId}`);
       if (fs.existsSync(videoPath)) {
@@ -831,77 +1031,100 @@ const hash = crypto.createHash('sha256');
         throw new Error('Missing video file');
       }
     }
-    
+
     let audioMetadata: any[] = [];
     if (metadataStr) {
       audioMetadata = JSON.parse(metadataStr);
     }
-    
+
     const jobId = Date.now().toString();
     exportCache.set(exportKey, jobId);
-    const outputVideoPath = path.join(os.tmpdir(), `output_${jobId}.mp4`);
-    
+    const outputVideoPath = path.join(process.cwd(), "outputs", `output_${jobId}.mp4`);
+    fs.mkdirSync(path.dirname(outputVideoPath), { recursive: true });
+
     exportJobs.set(jobId, { status: 'processing' });
     res.json({ jobId });
-    
+    const tempMixedAudio = path.join(os.tmpdir(), `mixed_${jobId}.m4a`);
+    const tempOutputVideoPath = path.join(os.tmpdir(), `.final_${jobId}.tmp.mp4`);
+
     // Process in background
     (async () => {
       let currentCmd = '';
       try {
         let hasOriginalAudio = false;
+        let originalAudioStreamCount = 0;
+        let videoDuration = 0;
         try {
           currentCmd = `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${videoPath}"`;
           const { stdout } = await execAsync(currentCmd);
-          if (stdout.trim().length > 0) hasOriginalAudio = true;
+          originalAudioStreamCount = stdout.trim().split('\n').filter(Boolean).length;
+          hasOriginalAudio = originalAudioStreamCount > 0;
         } catch(e) {
           logFfmpegDiagnostic('ffprobe (check original audio)', currentCmd, e, e.stderr, e.stdout);
         }
-        
-                let finalMapA = '';
-        const tempMixedAudio = path.join(os.tmpdir(), `mixed_${jobId}.m4a`);
-        const audioFiles = files.filter(f => f.fieldname.startsWith('audio_') && fs.statSync(f.path).size > 100);
-        
-        // STEP 1: Mix audio if needed
-        if (audioFiles.length > 0) {
+        try {
+          currentCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
+          const { stdout } = await execAsync(currentCmd);
+          videoDuration = Number(stdout.trim()) || 0;
+        } catch(e) {
+          logFfmpegDiagnostic('ffprobe (video duration)', currentCmd, e, e.stderr, e.stdout);
+        }
+        if (videoDuration <= 0) {
+          throw new Error('Export validation failed: invalid video duration');
+        }
+
+        const renderedSegments = await buildRenderedAudioSegments(files, audioMetadata);
+        validateSegmentTimeline(renderedSegments, videoDuration);
+        for (const segment of renderedSegments) {
+          console.log(
+            `[AUDIO SEGMENT] order=${segment.renderOrder} ` +
+            `key=${segment.key} segmentId=${segment.metadata.segmentId ?? 'unspecified'} ` +
+            `speakerId=${segment.metadata.speakerId ?? 'unspecified'} ` +
+            `voiceId=${segment.metadata.voiceId ?? 'unspecified'} ` +
+            `sourceStart=${formatSeconds(segment.startSeconds)}s ` +
+            `sourceEnd=${formatSeconds(segment.endSeconds)}s ` +
+            `ttsDuration=${formatSeconds(segment.ttsDuration)}s ` +
+            `file=${path.basename(segment.path)} ` +
+            `placement=${formatSeconds(segment.placementSeconds)}s rate=${segment.rate.toFixed(3)}`
+          );
+        }
+
+        let finalMapA = '';
+
+        // STEP 1: Mix validated TTS and the original bed audio exactly once.
+        if (renderedSegments.length > 0) {
            let mixCmd = `ffmpeg -nostdin -hide_banner -loglevel error`;
            let audioFilter = '';
            let mixInputs = '';
-           let inputCount = audioFiles.length;
-           
+           let inputCount = renderedSegments.length;
+
            if (hasOriginalAudio) {
                mixCmd += ` -i "${videoPath}"`;
-               audioFilter += `[0:a]volume=0.1[a0]; `;
+               audioFilter += `[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.1[a0]; `;
                mixInputs += `[a0]`;
                inputCount += 1;
            }
-           
-           for (let i = 0; i < audioFiles.length; i++) {
-              mixCmd += ` -i "${audioFiles[i].path}"`;
-              const af = audioFiles[i];
-              const meta = audioMetadata.find(m => m.key === af.fieldname);
-              let delayMs = 0;
-              if (meta && meta.start) {
-                const parts = meta.start.split(':');
-                let totalSeconds = 0;
-                if (parts.length === 3) {
-                   totalSeconds = parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2].replace(',', '.'));
-                } else if (parts.length === 2) {
-                   totalSeconds = parseInt(parts[0]) * 60 + parseFloat(parts[1].replace(',', '.'));
-                }
-                delayMs = Math.round(totalSeconds * 1000);
-              }
-              const inputIndex = hasOriginalAudio ? i + 1 : i;
-              audioFilter += `[${inputIndex}:a]adelay=${delayMs}|${delayMs}[a${inputIndex}]; `;
+
+           renderedSegments.forEach((segment, index) => {
+              const inputIndex = hasOriginalAudio ? index + 1 : index;
+              mixCmd += ` -i "${segment.path}"`;
+              const delayMs = Math.round(segment.placementSeconds * 1000);
+              const rate = segment.rate === 1
+                ? ''
+                : `,atempo=${segment.rate.toFixed(4)}`;
+              audioFilter +=
+                `[${inputIndex}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo${rate},` +
+                `adelay=${delayMs}|${delayMs}[a${inputIndex}]; `;
               mixInputs += `[a${inputIndex}]`;
+           });
+
+           if (inputCount === 1) {
+              audioFilter += `${mixInputs}aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
+           } else {
+              audioFilter += `${mixInputs}amix=inputs=${inputCount}:duration=first:dropout_transition=0:normalize=0[aout]`;
            }
-           
-           if (inputCount === 1) { 
-               audioFilter += `${mixInputs}volume=1[aout]`; 
-           } else { 
-               audioFilter += `${mixInputs}amix=inputs=${inputCount}:duration=longest:normalize=0[aout]`; 
-           }
-           
-           mixCmd += ` -filter_complex "${audioFilter}" -map "[aout]" -c:a aac -b:a 192k -y "${tempMixedAudio}"`;
+
+           mixCmd += ` -filter_complex "${audioFilter}" -map "[aout]" -c:a aac -ar 44100 -ac 2 -b:a 192k -y "${tempMixedAudio}"`;
            console.log('Running FFmpeg audio mix:', mixCmd);
            let mixResult;
            try {
@@ -912,47 +1135,32 @@ const hash = crypto.createHash('sha256');
                logFfmpegDiagnostic('ffmpeg (audio mix failure)', mixCmd, e, e.stderr, e.stdout);
                throw new Error('FFmpeg mix error: ' + (e.stderr || e.message).substring(0, 500));
            }
-           
+
            finalMapA = hasOriginalAudio ? '1:a' : '0:a';
         } else if (hasOriginalAudio) {
            finalMapA = '0:a';
         }
-        // STEP 2: Export Video WITHOUT burned-in subtitles
-let needsVideoReencode = false;
-let vFilter = '';
-let mapV = '0:v';
-
+        // STEP 2: Export one video stream and exactly one intended audio stream.
+        const mapV = '0:v';
 
         let videoCmd = `ffmpeg -nostdin -hide_banner -loglevel info -i "${videoPath}"`;
-        if (audioFiles.length > 0) {
+        if (renderedSegments.length > 0) {
             videoCmd += ` -i "${tempMixedAudio}"`;
         }
-        
-        if (vFilter) {
-        }
-        
+
         videoCmd += ` -map "${mapV}"`;
         if (finalMapA) {
             videoCmd += ` -map "${finalMapA}"`;
         }
-        
-        if (needsVideoReencode) {
-           videoCmd += ` -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p`;
-        } else {
-           videoCmd += ` -c:v copy`;
-        }
-        
-        if (audioFiles.length > 0 || hasOriginalAudio) {
-           videoCmd += ` -c:a aac -b:a 192k`;
-        }
-        
+
+        videoCmd += ` -c:v copy`;
+        videoCmd += ` -c:a aac -ar 44100 -ac 2 -b:a 192k`;
         videoCmd += ` -y "${outputVideoPath}"`;
-        
+
 
         console.log('Running FFmpeg video export:', videoCmd);
-        const tempOutputVideoPath = path.join(os.tmpdir(), `.final_${jobId}.tmp.mp4`);
         videoCmd = videoCmd.replace(`"${outputVideoPath}"`, `"${tempOutputVideoPath}"`);
-        
+
         // Export progress: 50% -> 90% based on real FFmpeg time.
         // Progress is monotonic and can never move backwards.
         exportJobs.set(jobId, { status: 'processing', progress: 50 });
@@ -1031,35 +1239,62 @@ let mapV = '0:v';
 
             child.on('error', reject);
         });
-        
-        // Validate with ffprobe
-        currentCmd = `ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1:nokey=1 "${tempOutputVideoPath}"`;
+
+        // Validate the rendered file before publishing it.
+        currentCmd = `ffprobe -v error -show_entries format=duration,size:stream=index,codec_type,codec_name,sample_rate,channels -of json "${tempOutputVideoPath}"`;
         try {
           const { stdout: probeOut } = await execAsync(currentCmd);
-          const [duration, size] = probeOut.trim().split('\n').map(Number);
-          
+          const probe = JSON.parse(probeOut);
+          const duration = Number(probe?.format?.duration);
+          const size = Number(probe?.format?.size);
+          const streams = Array.isArray(probe?.streams) ? probe.streams : [];
+          const videoStreams = streams.filter((stream: any) => stream.codec_type === 'video');
+          const audioStreams = streams.filter((stream: any) => stream.codec_type === 'audio');
+          const audioStream = audioStreams[0];
+
           if (!duration || duration <= 0 || !size || size <= 0) {
               throw new Error('Export validation failed: invalid duration or size');
+          }
+          if (videoStreams.length !== 1) {
+              throw new Error(`Export validation failed: expected 1 video stream, found ${videoStreams.length}`);
+          }
+          if (audioStreams.length !== 1) {
+              throw new Error(`Export validation failed: expected 1 audio stream, found ${audioStreams.length}`);
+          }
+          if (Number(audioStream?.sample_rate) !== 44100 || Number(audioStream?.channels) !== 2) {
+              throw new Error('Export validation failed: audio must be stereo 44.1 kHz');
+          }
+          if (Math.abs(duration - videoDuration) > 0.5) {
+              throw new Error('Export validation failed: output duration changed');
           }
         } catch (e) {
           logFfmpegDiagnostic('ffprobe (validate output)', currentCmd, e, e.stderr, e.stdout);
           throw e;
         }
-        
+
         fs.renameSync(tempOutputVideoPath, outputVideoPath);
         exportJobs.set(jobId, { status: 'completed', path: outputVideoPath, progress: 100 });
 
-        
+        files.forEach(f => {
+          try { fs.unlinkSync(f.path); } catch (e) {}
+        });
+        try { fs.unlinkSync(tempMixedAudio); } catch (e) {}
+        if (videoFileId) {
+          try { fs.unlinkSync(videoPath); } catch (e) {}
+        }
       } catch (err: any) {
         logFfmpegDiagnostic('ffmpeg (video export or overall failure)', currentCmd, err, err.stderr, err.stdout);
         exportJobs.set(jobId, { status: 'error', error: `FFMPEG_ERROR: ${err.stderr ? err.stderr.toString().substring(0, 200) : err.message}` });
-        
+
         // Try cleanup
         files.forEach(f => {
           try { fs.unlinkSync(f.path); } catch (e) {}
         });
         if (videoFileId) {
           try { fs.unlinkSync(videoPath); } catch (e) {}
+        }
+        for (const temporaryPath of [tempMixedAudio, tempOutputVideoPath]) {
+          try { fs.unlinkSync(temporaryPath); } catch (e) {}
         }
       }
     })();
@@ -1073,7 +1308,7 @@ app.get('/api/export/status/:jobId', async (req, res) => {
   const jobId = req.params.jobId;
   let job = exportJobs.get(jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
-  
+
   // Long polling: Keep the request open to prevent Cloud Run from throttling CPU
   // during FFmpeg background processing.
   let retries = 0;
@@ -1083,7 +1318,7 @@ app.get('/api/export/status/:jobId', async (req, res) => {
     if (!job) return res.status(404).json({ error: 'Job not found' });
     retries++;
   }
-  
+
   res.json(job);
 });
 

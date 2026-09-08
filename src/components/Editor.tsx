@@ -206,7 +206,8 @@ const videoRef = useRef<HTMLVideoElement>(null);
             id: l.id || `line-${Date.now()}-${idx}`,
             selected: true,
             generated: false,
-            audioUrl: null
+            audioUrl: null,
+            audioDuration: undefined
           }));
           setLines(newLines);
           // Keep ref synchronized immediately for MAGIC PROCESS.
@@ -245,6 +246,7 @@ const videoRef = useRef<HTMLVideoElement>(null);
 
   const generateAudioForLine = async (lineId: string, text: string): Promise<boolean> => {
     try {
+      if (generatingLines.has(lineId)) return false;
       setGeneratingLines(prev => {
         const next = new Set(prev);
         next.add(lineId);
@@ -269,11 +271,15 @@ const videoRef = useRef<HTMLVideoElement>(null);
       }
 
       const url = URL.createObjectURL(blob);
+      const audioDuration = Number(res.headers.get('X-TTS-Duration'));
+      if (!Number.isFinite(audioDuration) || audioDuration <= 0) {
+        throw new Error('TTS duration metadata is missing');
+      }
 
       // Update ref immediately so the next operation sees the latest audio.
       const updated = linesRef.current.map(l =>
         l.id === lineId
-          ? { ...l, generated: true, audioUrl: url }
+          ? { ...l, generated: true, audioUrl: url, audioDuration }
           : l
       );
 
@@ -491,7 +497,15 @@ const videoRef = useRef<HTMLVideoElement>(null);
         const audioData = await fetch(line.audioUrl as string).then(r => r.blob());
         const key = `audio_${i}`;
         formData.append(key, audioData, `${key}.mp3`);
-        audioMetadata.push({ key, start: line.start });
+        audioMetadata.push({
+          key,
+          start: line.start,
+          end: line.end,
+          segmentId: line.id,
+          speakerId: 'speaker-1',
+          voiceId: voice,
+          expectedDuration: line.audioDuration
+        });
       }
       
       formData.append('metadata', JSON.stringify(audioMetadata));
@@ -959,7 +973,7 @@ const videoRef = useRef<HTMLVideoElement>(null);
                 <textarea 
                   className="w-full bg-transparent text-sm font-medium text-gray-200 leading-relaxed outline-none resize-none border-b border-transparent focus:border-pink-500 transition-colors h-14"
                   value={line.text}
-                  onChange={(e) => setLines(lines.map(l => l.id === line.id ? { ...l, text: e.target.value, generated: false } : l))}
+                  onChange={(e) => setLines(lines.map(l => l.id === line.id ? { ...l, text: e.target.value, generated: false, audioUrl: undefined, audioDuration: undefined } : l))}
                 />
                 
                 {generatingLines.has(line.id) && (
